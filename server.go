@@ -23,10 +23,11 @@ import (
 */
 // Handlers
 type Handler struct {
-	ID int `json:"id"`
+	ID int64 `json:"id"`
 	Name string `json:"name"`
 }
 
+type HandlerFunction func(*Job)error
 // Jobs
 /*
 	Job statuses:
@@ -38,7 +39,7 @@ type Handler struct {
 
 */
 type Job struct {
-	ID int `json:"id"`
+	ID int64 `json:"id"`
 	Handler string `json:"handler"`
 	Status string `json:"status"`
 	Attempts int `json:"attempts"`
@@ -46,42 +47,47 @@ type Job struct {
 	Error string `json:"error"`
 }
 
-type JobServer struct {
-	API *gin.Engine
-	Database Database
-	Executor *Executor
+func NewJob(handler string, maxAttempts int) *Job {
+	return &Job{
+		ID: 0,
+		Handler: handler,
+		Status: "READY",
+		Attempts: 0,
+		MaxAttempts: maxAttempts, 
+		Error: "",
+	}
 }
 
-func NewJobServer(db Database) *JobServer {
-	executor := NewExecutor(10)
+func (j *Job) SetID(id int64) {
+	j.ID = id
+}
 
-	// Register API handlers
-	router := gin.Default()
+type JobServer struct {
+	Router *gin.Engine
+	Database Database
+	Handlers map[string]HandlerFunction
+	ExecutionChannel chan *Job
+}
 
-	// Jobs
-	router.POST("/api/jobs", CreateJob)
-	router.GET("/api/jobs", ListJobs)
-	router.GET("/api/jobs/:jobId", GetJob)
-	router.PATCH("/api/jobs/:jobId", UpdateJob)
 
-	// Job Handlers
-	router.GET("/api/handlers", ListHandlers)
-	router.GET("/api/handlers/:handlerId", GetHandler)
-
+func NewJobServer(db Database) *JobServer{
 	server := &JobServer{
-		router,
-		db,
-		executor,
+		Database: db,
+		Handlers: make(map[string]HandlerFunction),
+		ExecutionChannel: make(chan *Job, 10),
 	}
+	server.Router = server.CreateRouter()
+
 	return server
 }
+
 
 // At server startup
 
 func (s *JobServer) RegisterHandler(name string, fn HandlerFunction){
 	
 	// Add to the executor 
-	s.Executor.RegisterHandler(name, fn)
+	s.Handlers[name] = fn
 	
 	// Add to the Database
 	newHandler := &Handler{
@@ -93,7 +99,6 @@ func (s *JobServer) RegisterHandler(name string, fn HandlerFunction){
 		log.Fatal(err)
 	}
 
-
 	// Handler should have been attributed a non zero ID
 	if newHandler.ID == 0 {
 		log.Fatal("Handler incorrectly inserted into database. Id is 0")
@@ -102,45 +107,53 @@ func (s *JobServer) RegisterHandler(name string, fn HandlerFunction){
 	}
 }
 
-func (s *JobServer) listenForExecutionResults() {
-	for result := range s.Executor.ResultsChannel {
-		go s.processExecutionResult(result)
+func (s *JobServer) Submit(j *Job) {
+	s.ExecutionChannel <- j
+}
+
+func (s *JobServer) startJobExecution() {
+	// Start job executions
+	for job := range s.ExecutionChannel {
+		go s.execute(job)
 	}
 }
 
-func (s *JobServer) processExecutionResult(r ExecutionResult) {
+
+func (s *JobServer) execute(j *Job) {
 
 	// If it was successfull, mark the job as completed
-	if r.Error == nil {
-		r.Job.Status = "SUCCEDED"
-		err := s.Database.UpdateJob(r.Job)
+	j.Status = "RUNNING"
+	s.Database.UpdateJob(j)
+	jobErr := s.Handlers[j.Handler](j)
+	if jobErr == nil {
+		j.Status = "SUCCEDED"
+		_, err := s.Database.UpdateJob(j)
 		if err != nil {
-			log.Printf("Error updating Job %d in database %v\n", r.Job.ID, err)
+			log.Printf("Error updating Job %d in database %v\n", j.ID, err)
 		}
-
 		return
 	}
 
 	// If it failed, we need to assess if we need to retry it
-	if r.Job.Attempts >= r.Job.MaxAttempts {
-		r.Job.Status = "FAILED"
-		r.Job.Error = fmt.Sprint(r.Error)
-		s.Database.UpdateJob(r.Job)
+	if j.Attempts >= j.MaxAttempts {
+		j.Status = "FAILED"
+		j.Error = fmt.Sprint(jobErr)
+		s.Database.UpdateJob(j)
 	}
 
-	r.Job.Status = "TIMEOUT"
-	s.Database.UpdateJob(r.Job)
+	j.Status = "TIMEOUT"
+	s.Database.UpdateJob(j)
 	time.Sleep(time.Duration(100) * time.Millisecond)
 	
-	r.Job.Status = "RUNNING" 
-	r.Job.Attempts += 1 
-	s.Database.UpdateJob(r.Job)
-	s.Executor.Submit(r.Job)
+	j.Status = "READY" 
+	j.Attempts += 1 
+	s.Database.UpdateJob(j)
+	s.Submit(j)
 }
 
 
 func (s *JobServer) Run() {
-	go s.Executor.Start()
-	go s.listenForExecutionResults()
-	go s.API.Run()
+	go s.startJobExecution()
+	go s.Router.Run()
 }
+

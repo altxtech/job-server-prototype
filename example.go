@@ -5,6 +5,7 @@ import(
 	"time"
 	"math/rand"
 	"fmt"
+	// "github.com/altxtech/jobserver <- user imports my package
 )
 
 func DummyJob (j *Job) error {

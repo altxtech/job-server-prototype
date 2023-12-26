@@ -1,7 +1,0 @@
-
-
-
-
-/*
-	EXAMPLE USAGE
-*/
